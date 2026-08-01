@@ -51,6 +51,7 @@ use cfg_if::cfg_if;
 use kvm_sys::*;
 use libc::open64;
 use libc::EFAULT;
+use libc::EINTR;
 use libc::EINVAL;
 use libc::EIO;
 use libc::ENOENT;
@@ -93,6 +94,8 @@ use crate::VcpuSignalHandle;
 use crate::VcpuSignalHandleInner;
 use crate::Vm;
 use crate::VmCap;
+
+const KVM_PRE_FAULT_CHUNK_SIZE: u64 = 64 * 1024 * 1024;
 
 // Wrapper around KVM_SET_USER_MEMORY_REGION ioctl, which creates, modifies, or deletes a mapping
 // from guest physical to host user pages.
@@ -329,6 +332,8 @@ pub struct KvmVm {
     mem_slot_gaps: Mutex<BinaryHeap<Reverse<MemSlot>>>,
     caps: KvmVmCaps,
     force_disable_readonly_mem: bool,
+    #[cfg(target_arch = "aarch64")]
+    protected_vm_created: bool,
 }
 
 impl KvmVm {
@@ -358,6 +363,8 @@ impl KvmVm {
             mem_slot_gaps: Default::default(),
             caps: Default::default(),
             force_disable_readonly_mem: cfg.force_disable_readonly_mem,
+            #[cfg(target_arch = "aarch64")]
+            protected_vm_created: cfg.protection_type.isolates_memory(),
         };
         vm.caps.kvmclock_ctrl = vm.check_raw_capability(KvmCap::KvmclockCtrl);
         // Note: Capability ID 236 is overloaded (KVM_CAP_USER_CONFIGURE_NONCOHERENT_DMA_CROS on
@@ -626,6 +633,14 @@ impl KvmVm {
         }
     }
 
+    fn check_raw_capability_number(&self, capability: u32) -> bool {
+        // SAFETY:
+        // Safe because we know that our file is a KVM fd, and if the cap is invalid KVM assumes
+        // it's an unavailable extension and returns 0.
+        let ret = unsafe { ioctl_with_val(self, KVM_CHECK_EXTENSION, capability as c_ulong) };
+        ret > 0
+    }
+
     // Currently only used on aarch64, but works on any architecture.
     #[allow(dead_code)]
     /// Enables a KVM-specific capability for this VM, with the given arguments.
@@ -689,6 +704,15 @@ impl Vm for KvmVm {
             VmCap::ArmPmuV3 => self.check_raw_capability(KvmCap::ArmPmuV3),
             VmCap::DirtyLog => true,
             VmCap::PvClock => false,
+            #[cfg(target_arch = "aarch64")]
+            VmCap::Protected => {
+                // Upstream arm64 pKVM advertises protected VMs by accepting
+                // KVM_VM_TYPE_ARM_PROTECTED at KVM_CREATE_VM time. The older
+                // ACK KVM_CAP_ARM_PROTECTED_VM probe is still used for pvmfw
+                // controls and may be absent for direct/no-firmware pVMs.
+                self.protected_vm_created || self.check_raw_capability(KvmCap::ArmProtectedVm)
+            }
+            #[cfg(not(target_arch = "aarch64"))]
             VmCap::Protected => self.check_raw_capability(KvmCap::ArmProtectedVm),
             VmCap::EarlyInitCpuid => false,
             #[cfg(target_arch = "x86_64")]
@@ -696,6 +720,7 @@ impl Vm for KvmVm {
             VmCap::ReadOnlyMemoryRegion => {
                 !self.force_disable_readonly_mem && self.check_raw_capability(KvmCap::ReadonlyMem)
             }
+            VmCap::PreFaultMemory => self.check_raw_capability_number(KVM_CAP_PRE_FAULT_MEMORY),
             VmCap::MemNoncoherentDma => {
                 cfg!(feature = "noncoherent-dma")
                     && (self.check_raw_capability(KvmCap::MemNoncoherentDmaOrPreFaultMemory)
@@ -1050,6 +1075,63 @@ impl Vcpu for KvmVcpu {
         // type is well defined, hence the clippy allow attribute.
         let run = unsafe { &mut *(self.run_mmap.as_ptr() as *mut kvm_run) };
         run.immediate_exit = exit.into();
+    }
+
+    fn finalize_protected_vm(&self) -> Result<()> {
+        self.set_immediate_exit(true);
+        // SAFETY:
+        // Safe because this fd is a VCPU fd and the return result is checked.
+        let ret = unsafe { ioctl(self, KVM_RUN) };
+        self.set_immediate_exit(false);
+
+        if ret == 0 {
+            return Err(Error::new(EINVAL));
+        }
+
+        let err = Error::last();
+        if err.errno() != EINTR {
+            return Err(err);
+        }
+
+        Ok(())
+    }
+
+    fn pre_fault_memory(&self, gpa: u64, size: u64) -> Result<()> {
+        let mut chunk_gpa = gpa;
+        let mut remaining = size;
+
+        while remaining > 0 {
+            let chunk_size = std::cmp::min(remaining, KVM_PRE_FAULT_CHUNK_SIZE);
+            let mut range = kvm_pre_fault_memory {
+                gpa: chunk_gpa,
+                size: chunk_size,
+                ..Default::default()
+            };
+
+            while range.size > 0 {
+                let previous_size = range.size;
+
+                // SAFETY:
+                // Safe because this fd is a VCPU fd and the kernel mutates only the provided
+                // kvm_pre_fault_memory struct.
+                let ret = unsafe { ioctl_with_mut_ref(self, KVM_PRE_FAULT_MEMORY, &mut range) };
+                if ret != 0 {
+                    let err = Error::last();
+                    if err.errno() == EINTR {
+                        continue;
+                    }
+                    return Err(err);
+                }
+                if range.size >= previous_size {
+                    return Err(Error::new(EIO));
+                }
+            }
+
+            chunk_gpa += chunk_size;
+            remaining -= chunk_size;
+        }
+
+        Ok(())
     }
 
     fn signal_handle(&self) -> VcpuSignalHandle {

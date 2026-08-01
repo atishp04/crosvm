@@ -20,6 +20,19 @@ Hypervisors added to crosvm must meet the following requirements:
 
 KVM is crosvm's preferred hypervisor for Linux.
 
+### Arm protected guest memory
+
+Arm KVM protected VMs pin and map RAM on first guest access by default. Pass
+`--protected-vm-prefault true` with a protected-VM mode such as `--protected-vm-without-firmware` to
+pre-fault all guest RAM before execution. Use `--protected-vm-prefault false` to explicitly retain
+demand paging.
+
+Both settings finalize the protected VM before starting guest execution. Eager mapping requires
+`KVM_CAP_PRE_FAULT_MEMORY`, adds startup work proportional to guest RAM, and reports pinning errors
+before the guest runs. With it disabled, the kernel must handle protected guest memory faults, and
+pinning costs and errors occur as pages are accessed. `--lock-guest-memory` is a separate host swap
+policy.
+
 ## WHPX
 
 - Platforms: Windows

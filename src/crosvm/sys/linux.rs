@@ -152,6 +152,8 @@ use hypervisor::CpuConfigRiscv64;
 use hypervisor::CpuConfigX86_64;
 use hypervisor::Hypervisor;
 use hypervisor::HypervisorCap;
+#[cfg(target_arch = "aarch64")]
+use hypervisor::HypervisorKind as VmHypervisorKind;
 use hypervisor::MemCacheType;
 use hypervisor::ProtectionType;
 use hypervisor::Vm;
@@ -4037,6 +4039,39 @@ fn run_control(
         Some(vec) => vec.into_iter().map(Some).collect(),
         None => iter::repeat_with(|| None).take(linux.vcpu_count).collect(),
     };
+
+    #[cfg(target_arch = "aarch64")]
+    if cfg.protection_type.isolates_memory()
+        && matches!(linux.vm.hypervisor_kind(), VmHypervisorKind::Kvm)
+    {
+        if cfg.protected_vm_prefault && !linux.vm.check_capability(VmCap::PreFaultMemory) {
+            bail!("protected KVM VM requires KVM_CAP_PRE_FAULT_MEMORY");
+        }
+
+        let bootstrap_vcpu = vcpus
+            .iter()
+            .find_map(|vcpu| vcpu.as_ref())
+            .context("protected VM finalization requires a pre-created vCPU")?;
+
+        bootstrap_vcpu
+            .finalize_protected_vm()
+            .context("failed to finalize protected VM")?;
+
+        if cfg.protected_vm_prefault {
+            for region in linux.vm.get_memory().regions() {
+                bootstrap_vcpu
+                    .pre_fault_memory(region.guest_addr.offset(), region.size as u64)
+                    .with_context(|| {
+                        format!(
+                            "failed to pre-fault protected VM memory gpa=0x{:x} size=0x{:x}",
+                            region.guest_addr.offset(),
+                            region.size
+                        )
+                    })?;
+            }
+        }
+    }
+
     // Enable core scheduling before creating vCPUs so that the cookie will be
     // shared by all vCPU threads.
     // TODO(b/199312402): Avoid enabling core scheduling for the crosvm process

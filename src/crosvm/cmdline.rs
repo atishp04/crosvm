@@ -1714,6 +1714,12 @@ pub struct RunCommand {
     /// prevent host access to guest memory
     pub protected_vm: Option<bool>,
 
+    #[cfg(target_arch = "aarch64")]
+    #[argh(option, arg_name = "BOOL")]
+    /// pre-fault all Arm KVM protected guest RAM before execution (default: false).
+    /// false maps RAM on first guest access; vCPU finalization is unchanged.
+    pub protected_vm_prefault: Option<bool>,
+
     #[argh(option, arg_name = "PATH")]
     /// (EXPERIMENTAL/FOR DEBUGGING) Use custom VM firmware to run in protected mode
     pub protected_vm_with_firmware: Option<PathBuf>,
@@ -3168,6 +3174,14 @@ impl TryFrom<RunCommand> for super::config::Config {
             ProtectionType::Unprotected
         };
 
+        #[cfg(target_arch = "aarch64")]
+        if let Some(prefault) = cmd.protected_vm_prefault {
+            if !cfg.protection_type.isolates_memory() {
+                return Err("--protected-vm-prefault requires a protected VM".to_string());
+            }
+            cfg.protected_vm_prefault = prefault;
+        }
+
         if !matches!(cfg.protection_type, ProtectionType::Unprotected) {
             // USB devices only work for unprotected VMs.
             cfg.usb = false;
@@ -3346,6 +3360,8 @@ fn format_disk_letter(dev_prefix: &str, mut i: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_arch = "aarch64")]
+    use crate::crosvm::config::Config;
 
     #[test]
     fn disk_letter() {
@@ -3383,6 +3399,58 @@ mod tests {
         let cmd = RunCommand::from_args(&[], &["--mte", "--cpus", "mte=[auto=true]", "/dev/null"])
             .unwrap();
         assert!(crate::crosvm::config::Config::try_from(cmd).is_err());
+    }
+
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    fn parse_protected_vm_prefault() {
+        use argh::FromArgs;
+
+        let cmd =
+            RunCommand::from_args(&[], &["--protected-vm-without-firmware", "/dev/null"]).unwrap();
+        let cfg = Config::try_from(cmd).unwrap();
+        assert!(!cfg.protected_vm_prefault);
+
+        for (value, enabled) in [("true", true), ("false", false)] {
+            let cmd = RunCommand::from_args(
+                &[],
+                &[
+                    "--protected-vm-without-firmware",
+                    "--protected-vm-prefault",
+                    value,
+                    "/dev/null",
+                ],
+            )
+            .unwrap();
+            let cfg = Config::try_from(cmd).unwrap();
+            assert_eq!(cfg.protected_vm_prefault, enabled);
+            assert!(cfg.protection_type.isolates_memory());
+        }
+
+        let cmd =
+            RunCommand::from_args(&[], &["--protected-vm-prefault", "false", "/dev/null"]).unwrap();
+        assert!(Config::try_from(cmd).is_err());
+        assert!(
+            RunCommand::from_args(&[], &["--protected-vm-prefault", "maybe", "/dev/null"],)
+                .is_err()
+        );
+    }
+
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    fn protected_vm_prefault_config_defaults() {
+        let mut json = serde_json::to_value(Config::default()).unwrap();
+        json.as_object_mut()
+            .unwrap()
+            .remove("protected_vm_prefault");
+        let legacy: Config = serde_json::from_value(json.clone()).unwrap();
+        assert!(!legacy.protected_vm_prefault);
+
+        for enabled in [false, true] {
+            json["protected_vm_prefault"] = serde_json::Value::Bool(enabled);
+            let cfg: Config = serde_json::from_value(json.clone()).unwrap();
+            assert_eq!(cfg.protected_vm_prefault, enabled);
+        }
     }
 
     #[test]

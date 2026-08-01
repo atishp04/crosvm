@@ -736,6 +736,9 @@ pub struct Config {
     pub product_name: Option<String>,
     #[cfg(windows)]
     pub product_version: Option<String>,
+    #[cfg(target_arch = "aarch64")]
+    #[serde(default)]
+    pub protected_vm_prefault: bool,
     pub protection_type: ProtectionType,
     pub pstore: Option<Pstore>,
     #[cfg(feature = "pvclock")]
@@ -973,6 +976,8 @@ impl Default for Config {
             process_invariants_data_size: None,
             #[cfg(windows)]
             product_name: None,
+            #[cfg(target_arch = "aarch64")]
+            protected_vm_prefault: false,
             protection_type: ProtectionType::Unprotected,
             pstore: None,
             #[cfg(feature = "pvclock")]

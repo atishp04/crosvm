@@ -404,6 +404,16 @@ pub trait Vcpu: std::any::Any + Send + Sync {
     /// Sets the bit that requests an immediate exit.
     fn set_immediate_exit(&self, exit: bool);
 
+    /// Finalizes a protected VM before userspace begins normal vCPU execution.
+    fn finalize_protected_vm(&self) -> Result<()> {
+        Err(std::io::Error::from(std::io::ErrorKind::Unsupported).into())
+    }
+
+    /// Pre-faults a guest physical range for protected VM memory isolation.
+    fn pre_fault_memory(&self, _gpa: u64, _size: u64) -> Result<()> {
+        Err(std::io::Error::from(std::io::ErrorKind::Unsupported).into())
+    }
+
     /// Returns a handle that can be used to cause this VCPU to exit from `run()` from a signal
     /// handler.
     #[cfg(any(target_os = "android", target_os = "linux"))]

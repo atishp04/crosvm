@@ -55,6 +55,8 @@ pub enum VmCap {
     BusLockDetect,
     /// Supports read-only memory regions.
     ReadOnlyMemoryRegion,
+    /// VM supports pre-faulting guest memory before vCPU execution.
+    PreFaultMemory,
     /// VM can set guest memory cache noncoherent DMA flag
     MemNoncoherentDma,
     /// If supported, this VM supports enabling ARM MTE (Memory Tagging Extension).

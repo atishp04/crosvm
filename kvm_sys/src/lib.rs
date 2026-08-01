@@ -150,6 +150,7 @@ ioctl_iowr_nr!(KVM_CREATE_DEVICE, KVMIO, 0xe0, kvm_create_device);
 ioctl_iow_nr!(KVM_SET_DEVICE_ATTR, KVMIO, 0xe1, kvm_device_attr);
 ioctl_iow_nr!(KVM_GET_DEVICE_ATTR, KVMIO, 0xe2, kvm_device_attr);
 ioctl_iow_nr!(KVM_HAS_DEVICE_ATTR, KVMIO, 0xe3, kvm_device_attr);
+ioctl_iowr_nr!(KVM_PRE_FAULT_MEMORY, KVMIO, 0xd5, kvm_pre_fault_memory);
 ioctl_io_nr!(KVM_RUN, KVMIO, 0x80);
 ioctl_ior_nr!(KVM_GET_REGS, KVMIO, 0x81, kvm_regs);
 ioctl_iow_nr!(KVM_SET_REGS, KVMIO, 0x82, kvm_regs);
