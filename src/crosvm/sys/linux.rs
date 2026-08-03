@@ -4041,7 +4041,7 @@ fn run_control(
     };
 
     #[cfg(target_arch = "aarch64")]
-    let protected_kvm_prefault_vcpu = if cfg.protection_type.isolates_memory()
+    let protected_kvm_vcpus = if cfg.protection_type.isolates_memory()
         && matches!(linux.vm.hypervisor_kind(), VmHypervisorKind::Kvm)
     {
         if cfg.restore_path.is_some() {
@@ -4051,13 +4051,25 @@ fn run_control(
         if cfg.protected_vm_prefault && !linux.vm.check_capability(VmCap::PreFaultMemory) {
             bail!("protected KVM VM requires KVM_CAP_PRE_FAULT_MEMORY");
         }
+        if vcpus.len() != linux.vcpu_count {
+            bail!(
+                "protected VM finalization requires {} pre-created vCPUs, found {}",
+                linux.vcpu_count,
+                vcpus.len()
+            );
+        }
 
-        let bootstrap_vcpu = vcpus
+        let protected_vcpus = vcpus
             .iter()
-            .find_map(|vcpu| vcpu.as_ref())
-            .context("protected VM finalization requires a pre-created vCPU")?;
+            .enumerate()
+            .map(|(vcpu_id, vcpu)| {
+                vcpu.as_ref().cloned().with_context(|| {
+                    format!("protected VM finalization requires pre-created vCPU {vcpu_id}")
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
 
-        Some(bootstrap_vcpu.clone())
+        Some(protected_vcpus)
     } else {
         None
     };
@@ -4159,7 +4171,8 @@ fn run_control(
     };
 
     #[cfg(target_arch = "aarch64")]
-    let initial_vcpu_run_mode = if protected_kvm_prefault_vcpu.is_some() {
+    let initial_vcpu_run_mode = if protected_kvm_vcpus.is_some() {
+        // The main thread primes every protected vCPU fd after the setup barrier below.
         VmRunMode::Suspending
     } else {
         run_mode
@@ -4340,23 +4353,49 @@ fn run_control(
     vcpu_thread_barrier.wait();
 
     #[cfg(target_arch = "aarch64")]
-    if let Some(bootstrap_vcpu) = &protected_kvm_prefault_vcpu {
-        bootstrap_vcpu
-            .finalize_protected_vm()
-            .context("failed to finalize protected VM")?;
+    if let Some(protected_vcpus) = &protected_kvm_vcpus {
+        let setup_result = (|| -> Result<()> {
+            // pKVM publishes each hyp vCPU on its first KVM_RUN. Arm64 setup leaves exactly the
+            // boot vCPU runnable and marks every secondary POWER_OFF. That exactly-one-RUNNABLE
+            // invariant elects one primary; ID order only makes the priming sequence deterministic.
+            for (vcpu_id, vcpu) in protected_vcpus.iter().enumerate() {
+                vcpu.finalize_protected_vm()
+                    .with_context(|| format!("failed to finalize protected VM vCPU {vcpu_id}"))?;
+            }
 
-        if cfg.protected_vm_prefault {
+            if !cfg.protected_vm_prefault {
+                return Ok(());
+            }
+
+            let bootstrap_vcpu = protected_vcpus.get(cfg.boot_cpu).with_context(|| {
+                format!(
+                    "protected VM pre-fault requires boot vCPU {} to be pre-created",
+                    cfg.boot_cpu
+                )
+            })?;
             for region in linux.vm.get_memory().regions() {
                 bootstrap_vcpu
                     .pre_fault_memory(region.guest_addr.offset(), region.size as u64)
                     .with_context(|| {
                         format!(
-                            "failed to pre-fault protected VM memory gpa=0x{:x} size=0x{:x}",
+                            "failed to pre-fault protected VM memory through vCPU {} gpa=0x{:x} size=0x{:x}",
+                            bootstrap_vcpu.id(),
                             region.guest_addr.offset(),
                             region.size
                         )
                     })?;
             }
+
+            Ok(())
+        })();
+
+        if let Err(err) = setup_result {
+            vcpu::kick_all_vcpus(
+                &vcpu_handles,
+                &*linux.irq_chip,
+                VcpuControl::RunState(VmRunMode::Exiting),
+            );
+            return Err(err);
         }
 
         vcpu::kick_all_vcpus(
