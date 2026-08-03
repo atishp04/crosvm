@@ -4041,9 +4041,13 @@ fn run_control(
     };
 
     #[cfg(target_arch = "aarch64")]
-    if cfg.protection_type.isolates_memory()
+    let protected_kvm_prefault_vcpu = if cfg.protection_type.isolates_memory()
         && matches!(linux.vm.hypervisor_kind(), VmHypervisorKind::Kvm)
     {
+        if cfg.restore_path.is_some() {
+            bail!("protected KVM VM does not support restore");
+        }
+
         if cfg.protected_vm_prefault && !linux.vm.check_capability(VmCap::PreFaultMemory) {
             bail!("protected KVM VM requires KVM_CAP_PRE_FAULT_MEMORY");
         }
@@ -4053,24 +4057,10 @@ fn run_control(
             .find_map(|vcpu| vcpu.as_ref())
             .context("protected VM finalization requires a pre-created vCPU")?;
 
-        bootstrap_vcpu
-            .finalize_protected_vm()
-            .context("failed to finalize protected VM")?;
-
-        if cfg.protected_vm_prefault {
-            for region in linux.vm.get_memory().regions() {
-                bootstrap_vcpu
-                    .pre_fault_memory(region.guest_addr.offset(), region.size as u64)
-                    .with_context(|| {
-                        format!(
-                            "failed to pre-fault protected VM memory gpa=0x{:x} size=0x{:x}",
-                            region.guest_addr.offset(),
-                            region.size
-                        )
-                    })?;
-            }
-        }
-    }
+        Some(bootstrap_vcpu.clone())
+    } else {
+        None
+    };
 
     // Enable core scheduling before creating vCPUs so that the cookie will be
     // shared by all vCPU threads.
@@ -4168,6 +4158,15 @@ fn run_control(
         (run_mode, run_mode)
     };
 
+    #[cfg(target_arch = "aarch64")]
+    let initial_vcpu_run_mode = if protected_kvm_prefault_vcpu.is_some() {
+        VmRunMode::Suspending
+    } else {
+        run_mode
+    };
+    #[cfg(not(target_arch = "aarch64"))]
+    let initial_vcpu_run_mode = run_mode;
+
     // Architecture-specific code must supply a vcpu_init element for each VCPU.
     assert_eq!(vcpus.len(), linux.vcpu_init.len());
 
@@ -4253,7 +4252,7 @@ fn run_control(
             },
             #[cfg(target_arch = "x86_64")]
             bus_lock_ratelimit_ctrl,
-            run_mode,
+            initial_vcpu_run_mode,
             cfg.boost_uclamp,
             vcpu_pid_tid_sender.clone(),
         )?;
@@ -4339,6 +4338,33 @@ fn run_control(
         .unwrap();
 
     vcpu_thread_barrier.wait();
+
+    #[cfg(target_arch = "aarch64")]
+    if let Some(bootstrap_vcpu) = &protected_kvm_prefault_vcpu {
+        bootstrap_vcpu
+            .finalize_protected_vm()
+            .context("failed to finalize protected VM")?;
+
+        if cfg.protected_vm_prefault {
+            for region in linux.vm.get_memory().regions() {
+                bootstrap_vcpu
+                    .pre_fault_memory(region.guest_addr.offset(), region.size as u64)
+                    .with_context(|| {
+                        format!(
+                            "failed to pre-fault protected VM memory gpa=0x{:x} size=0x{:x}",
+                            region.guest_addr.offset(),
+                            region.size
+                        )
+                    })?;
+            }
+        }
+
+        vcpu::kick_all_vcpus(
+            &vcpu_handles,
+            &*linux.irq_chip,
+            VcpuControl::RunState(run_mode),
+        );
+    }
 
     // See comment on `VmRequest::execute`.
     let mut suspended_pvclock_state: Option<hypervisor::ClockState> = None;
